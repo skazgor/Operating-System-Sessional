@@ -1,0 +1,570 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..a35822b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -132,6 +132,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_cowtest\
++	$U/_cowfiletest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..63873d8 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,8 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++void            increase_ref_count(uint64 pa);
++void            decrease_ref_count(uint64 pa);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..419886b 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -13,7 +13,7 @@ void freerange(void *pa_start, void *pa_end);
+ 
+ extern char end[]; // first address after kernel.
+                    // defined by kernel.ld.
+-
++uint16 ref_count[REF_COUNT_INDEX(PHYSTOP)+1];
+ struct run {
+   struct run *next;
+ };
+@@ -27,6 +27,9 @@ void
+ kinit()
+ {
+   initlock(&kmem.lock, "kmem");
++  for(int i = 0; i < REF_COUNT_INDEX(PHYSTOP)+1; i++)
++    ref_count[i] = 0;
++  // printf("%p", end);
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -39,6 +42,42 @@ freerange(void *pa_start, void *pa_end)
+     kfree(p);
+ }
+ 
++void
++increase_ref_count(uint64 pa)
++{
++  if((char*)pa < end || (uint64)pa >= PHYSTOP)
++    return;
++  acquire(&kmem.lock);
++  ref_count[REF_COUNT_INDEX(pa)]++;
++  release(&kmem.lock);
++  // printf("Increasing ref count to %d for page %p\n ", ref_count[REF_COUNT_INDEX(pa)], pa);
++}
++
++void
++decrease_ref_count(uint64 pa)
++{
++  if((char*)pa < end || (uint64)pa >= PHYSTOP)
++    return;
++  
++  // printf("Decreasing ref count to %d for page %p\n ", ref_count[REF_COUNT_INDEX(pa)], pa);
++  acquire(&kmem.lock);
++  int ref_cnt=ref_count[REF_COUNT_INDEX(pa)];
++  release(&kmem.lock);
++  if( ref_cnt== 1)
++  {
++    #ifdef PRINT
++    printf("Ref count 0.Freeing Page\n");
++    #endif
++    kfree((void*)PGROUNDDOWN(pa));
++  }
++  else
++  {
++    acquire(&kmem.lock);
++    ref_count[REF_COUNT_INDEX(pa)]--;
++    release(&kmem.lock);
++  }
++}
++
+ // Free the page of physical memory pointed at by pa,
+ // which normally should have been returned by a
+ // call to kalloc().  (The exception is when
+@@ -49,9 +88,17 @@ kfree(void *pa)
+   struct run *r;
+ 
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
++  {
+     panic("kfree");
+-
++  }
+   // Fill with junk to catch dangling refs.
++  if(ref_count[REF_COUNT_INDEX(pa)] > 1)
++  {
++    acquire(&kmem.lock);
++   ref_count[REF_COUNT_INDEX(pa)]--;
++    release(&kmem.lock);
++    return;
++  }
+   memset(pa, 1, PGSIZE);
+ 
+   r = (struct run*)pa;
+@@ -59,6 +106,7 @@ kfree(void *pa)
+   acquire(&kmem.lock);
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++   ref_count[REF_COUNT_INDEX(pa)] = 0;
+   release(&kmem.lock);
+ }
+ 
+@@ -74,9 +122,13 @@ kalloc(void)
+   r = kmem.freelist;
+   if(r)
+     kmem.freelist = r->next;
++  if ((char*)r>=end && (uint64)r < PHYSTOP)
++    ref_count[REF_COUNT_INDEX(r)] = 1;
+   release(&kmem.lock);
+ 
+   if(r)
++  {
+     memset((char*)r, 5, PGSIZE); // fill with junk
++  }
+   return (void*)r;
+ }
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..8a9d432 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
++#define PTE_COW (1L << 9) // copy-on-write
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+@@ -361,3 +362,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ // Sv39, to avoid having to sign-extend virtual addresses
+ // that have the high bit set.
+ #define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
++
++//ref count for page index
++#define REF_COUNT_INDEX(pa) ((uint64)(pa)/PGSIZE)
++#define PRINT 0
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..09f4e2c 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -15,6 +15,7 @@ extern char trampoline[], uservec[], userret[];
+ void kernelvec();
+ 
+ extern int devintr();
++extern pagetable_t kernel_pagetable;
+ 
+ void
+ trapinit(void)
+@@ -65,6 +66,41 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++  }else if(r_scause()==15){
++    uint64 va=r_stval();
++    va=PGROUNDDOWN(va);
++    if(va>=p->sz){
++      printf("usertrap(): page fault va=%p\n", va);
++      setkilled(p);
++      goto end;
++    }
++    pte_t *pte=walk(p->pagetable,va,0);
++    if(pte==0){
++      printf("usertrap(): page fault va=%p\n", va);
++      setkilled(p);
++    }else{
++      uint64 pa=PTE2PA(*pte);
++      uint64 flags=PTE_FLAGS(*pte);
++      if((*pte & PTE_V) && (*pte & PTE_U) && (*pte & PTE_COW)){
++        char *mem=kalloc();
++        if(mem==0){
++          printf("usertrap(): out of memory\n");
++          setkilled(p);
++        }else{
++          memmove(mem,(char*)pa,PGSIZE);
++          flags=flags&~PTE_COW;
++          flags=flags|PTE_W;
++          uvmunmap(p->pagetable,va,1,0);
++          #ifdef PRINT
++          printf("usertrap(): copy on write. Allocating new page\n");
++          #endif
++          decrease_ref_count(pa);
++          mappages(p->pagetable,va,PGSIZE,(uint64)mem,flags);
++        }
++      }else{
++        setkilled(p);
++      }
++  }
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+@@ -72,7 +108,7 @@ usertrap(void)
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     setkilled(p);
+   }
+-
++  end:
+   if(killed(p))
+     exit(-1);
+ 
+@@ -144,7 +180,7 @@ kerneltrap()
+   if(intr_get() != 0)
+     panic("kerneltrap: interrupts enabled");
+ 
+-  if((which_dev = devintr()) == 0){
++   if((which_dev = devintr()) == 0){
+     printf("scause %p\n", scause);
+     printf("sepc=%p stval=%p\n", r_sepc(), r_stval());
+     panic("kerneltrap");
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..a2598d4 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -308,8 +308,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
+-
++  
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+@@ -317,17 +316,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+       panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++    if((flags & PTE_W) != 0){
++       flags&=(~PTE_W);
++      flags|=PTE_COW;
++    }
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+       goto err;
+     }
++    increase_ref_count(pa);
++    uvmunmap(old, i, 1, 0);
++    mappages(old, i, PGSIZE, pa, flags);
+   }
+   return 0;
+ 
+  err:
++  for(int j = 0; j < i; j += PGSIZE){
++    pte = walk(new, j, 0);
++    pa = PTE2PA(*pte);
++    printf("here reached\n");
++    decrease_ref_count(pa);
++  }
+   uvmunmap(new, 0, i / PGSIZE, 1);
+   return -1;
+ }
+@@ -352,12 +360,37 @@ int
+ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
++  pte_t *pte;
++  uint32 flags;
++  char *mem;
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
++    if(va0>=MAXVA)
+       return -1;
++    pte = walk (pagetable, va0, 0);
++    if(pte == 0)
++      return -1;
++    if((*pte & PTE_V) == 0)
++      return -1;
++    if((*pte & PTE_U) == 0)
++      return -1;
++    flags = PTE_FLAGS(*pte);
++    if((flags & PTE_COW) != 0)
++      {
++        // printf("copyout: COW\n");
++        mem= kalloc();
++        memmove(mem, (void *)PTE2PA(*pte), PGSIZE);
++        flags&=(~PTE_COW);
++        flags|=PTE_W;
++        #ifdef PRINT
++        printf("This ia a COW page in the copyout function\n");
++        #endif
++        decrease_ref_count(PTE2PA(*pte));
++        uvmunmap(pagetable, va0, 1, 0);
++        mappages(pagetable, va0, PGSIZE, (uint64)mem, flags);
++      }
++    pa0=walkaddr(pagetable, va0);
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+       n = len;
+diff --git a/user/cowfiletest.c b/user/cowfiletest.c
+new file mode 100644
+index 0000000..e83129a
+--- /dev/null
++++ b/user/cowfiletest.c
+@@ -0,0 +1,49 @@
++ #include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++
++int
++main(int argc, char *argv[])
++{
++  printf("Before sbrk\n");
++  sbrk(100*4096);
++  char *a = malloc(100*4096);
++  printf("After sbrk\n");
++  int pid=fork();
++  if(pid>0){
++    wait(0);
++  }
++  for (int i = 0; i < 409600; i++)
++  {
++    *a='a';
++    a++;
++  }
++  a--;
++  char* white_to_file=(char*) (60*4096 + 30);
++  char *temp=white_to_file;
++  for(;temp<white_to_file+4096;temp++)
++  {
++    *temp='b';
++  }
++  printf("Before open\n");
++  int fd = open("file", O_CREATE|O_RDWR);
++  printf("After open\n");
++  int n=write(fd, white_to_file, 4096);
++  char *b =(char *) (20*4096 + 30);
++  close(fd);
++  fd = open("file", O_RDWR);
++  int m=read(fd, b, 4096);
++
++  printf("%d %d %d\n", fd, n, m);
++  for(int i=0;i<4046/256;i++)
++  {
++    printf("%c",b[i]);
++  }
++   close(fd);
++
++  printf("\n------ Test Done-------\n");
++ 
++  return 0;
++}  
+\ No newline at end of file
+diff --git a/user/cowtest.c b/user/cowtest.c
+new file mode 100644
+index 0000000..29b918f
+--- /dev/null
++++ b/user/cowtest.c
+@@ -0,0 +1,197 @@
++//
++// tests for copy-on-write fork() assignment.
++//
++
++#include "kernel/types.h"
++#include "kernel/memlayout.h"
++#include "user/user.h"
++
++// allocate more than half of physical memory,
++// then fork. this will fail in the default
++// kernel, which does not support copy-on-write.
++void
++simpletest()
++{
++  uint64 phys_size = PHYSTOP - KERNBASE;
++  int sz = (phys_size / 3) * 2;
++
++  printf("simple: ");
++  
++  char *p = sbrk(sz);
++  if(p == (char*)0xffffffffffffffffL){
++    printf("sbrk(%d) failed\n", sz);
++    exit(-1);
++  }
++
++  for(char *q = p; q < p + sz; q += 4096){
++    *(int*)q = getpid();
++  }
++
++  int pid = fork();
++  if(pid < 0){
++    printf("fork() failed\n");
++    exit(-1);
++  }
++
++  if(pid == 0)
++    exit(0);
++
++  wait(0);
++
++  if(sbrk(-sz) == (char*)0xffffffffffffffffL){
++    printf("sbrk(-%d) failed\n", sz);
++    exit(-1);
++  }
++
++  printf("ok\n");
++}
++
++// three processes all write COW memory.
++// this causes more than half of physical memory
++// to be allocated, so it also checks whether
++// copied pages are freed.
++void
++threetest()
++{
++  uint64 phys_size = PHYSTOP - KERNBASE;
++  int sz = phys_size / 4;
++  int pid1, pid2;
++
++  printf("three: ");
++  
++  char *p = sbrk(sz);
++  if(p == (char*)0xffffffffffffffffL){
++    printf("sbrk(%d) failed\n", sz);
++    exit(-1);
++  }
++
++  pid1 = fork();
++  if(pid1 < 0){
++    printf("fork failed\n");
++    exit(-1);
++  }
++  if(pid1 == 0){
++    pid2 = fork();
++    if(pid2 < 0){
++      printf("fork failed");
++      exit(-1);
++    }
++    if(pid2 == 0){
++      for(char *q = p; q < p + (sz/5)*4; q += 4096){
++        *(int*)q = getpid();
++      }
++      for(char *q = p; q < p + (sz/5)*4; q += 4096){
++        if(*(int*)q != getpid()){
++          printf("wrong content\n");
++          exit(-1);
++        }
++      }
++      exit(-1);
++    }
++    for(char *q = p; q < p + (sz/2); q += 4096){
++      *(int*)q = 9999;
++    }
++    exit(0);
++  }
++
++  for(char *q = p; q < p + sz; q += 4096){
++    *(int*)q = getpid();
++  }
++
++  wait(0);
++
++  sleep(1);
++
++  for(char *q = p; q < p + sz; q += 4096){
++    if(*(int*)q != getpid()){
++      printf("wrong content\n");
++      exit(-1);
++    }
++  }
++
++  if(sbrk(-sz) == (char*)0xffffffffffffffffL){
++    printf("sbrk(-%d) failed\n", sz);
++    exit(-1);
++  }
++
++  printf("ok\n");
++}
++
++char junk1[4096];
++int fds[2];
++char junk2[4096];
++char buf[4096];
++char junk3[4096];
++
++// test whether copyout() simulates COW faults.
++void
++filetest()
++{
++  printf("file: ");
++  
++  buf[0] = 99;
++
++  for(int i = 0; i < 4; i++){
++    if(pipe(fds) != 0){
++      printf("pipe() failed\n");
++      exit(-1);
++    }
++    int pid = fork();
++    if(pid < 0){
++      printf("fork failed\n");
++      exit(-1);
++    }
++    if(pid == 0){
++      sleep(1);
++      if(read(fds[0], buf, sizeof(i)) != sizeof(i)){
++        printf("error: read failed\n");
++        exit(1);
++      }
++      sleep(1);
++      int j = *(int*)buf;
++      if(j != i){
++        printf("error: read the wrong value\n");
++        exit(1);
++      }
++      exit(0);
++    }
++    if(write(fds[1], &i, sizeof(i)) != sizeof(i)){
++      printf("error: write failed\n");
++      exit(-1);
++    }
++  }
++
++  int xstatus = 0;
++  for(int i = 0; i < 4; i++) {
++    wait(&xstatus);
++    if(xstatus != 0) {
++      exit(1);
++    }
++  }
++
++  if(buf[0] != 99){
++    printf("error: child overwrote parent\n");
++    exit(1);
++  }
++
++  printf("ok\n");
++}
++
++int
++main(int argc, char *argv[])
++{
++  simpletest();
++
++  // check that the first simpletest() freed the physical memory.
++  simpletest();
++
++  threetest();
++  threetest();
++  threetest();
++
++  filetest();
++
++  printf("ALL COW TESTS PASSED\n");
++
++  exit(0);
++}
